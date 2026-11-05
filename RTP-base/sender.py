@@ -1,16 +1,90 @@
 import argparse
 import socket
+import sys
+import time
 
 from utils import PacketHeader, compute_checksum
 
+TIMEOUT = 0.5
+MAX_PAYLOAD = 1472 - 16
+
+
+def make_packet(pkt_type, seq_num, payload=b""):
+    pkt_header = PacketHeader(type=pkt_type, seq_num=seq_num, length=len(payload), checksum=0)
+    pkt_header.checksum = compute_checksum(pkt_header / payload)
+    return bytes(pkt_header / payload)
+
+
+def read_ack(raw):
+    if len(raw) < 16:
+        return None
+    pkt_header = PacketHeader(raw[:16])
+    msg = raw[16 : 16 + pkt_header.length]
+    if len(msg) != pkt_header.length:
+        return None
+    pkt_checksum = pkt_header.checksum
+    pkt_header.checksum = 0
+    if pkt_header.type != 3 or pkt_checksum != compute_checksum(pkt_header / msg):
+        return None
+    return pkt_header.seq_num
+
 
 def sender(receiver_ip, receiver_port, window_size):
-    """TODO: Open socket and send message from sys.stdin."""
+    address = (receiver_ip, receiver_port)
+    message = sys.stdin.buffer.read()
+    chunks = [message[i : i + MAX_PAYLOAD] for i in range(0, len(message), MAX_PAYLOAD)]
+    total = len(chunks)
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    pkt_header = PacketHeader(type=2, seq_num=10, length=14)
-    pkt_header.checksum = compute_checksum(pkt_header / "Hello, world!\n")
-    pkt = pkt_header / "Hello, world!\n"
-    s.sendto(bytes(pkt), (receiver_ip, receiver_port))
+
+    s.settimeout(TIMEOUT)
+    while True:
+        s.sendto(make_packet(0, 0), address)
+        try:
+            ack = read_ack(s.recvfrom(2048)[0])
+        except socket.timeout:
+            continue
+        if ack == 1:
+            break
+
+    base = 1
+    next_seq = 1
+    deadline = time.monotonic() + TIMEOUT
+
+    while base <= total:
+        while next_seq < base + window_size and next_seq <= total:
+            s.sendto(make_packet(2, next_seq, chunks[next_seq - 1]), address)
+            next_seq += 1
+
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            for seq in range(base, next_seq):
+                s.sendto(make_packet(2, seq, chunks[seq - 1]), address)
+            deadline = time.monotonic() + TIMEOUT
+            continue
+
+        s.settimeout(remain)
+        try:
+            ack = read_ack(s.recvfrom(2048)[0])
+        except socket.timeout:
+            continue
+
+        if ack is not None and ack > base:
+            base = min(ack, total + 1)
+            deadline = time.monotonic() + TIMEOUT
+
+    end_seq = total + 1
+    s.settimeout(TIMEOUT)
+    while True:
+        s.sendto(make_packet(1, end_seq), address)
+        try:
+            ack = read_ack(s.recvfrom(2048)[0])
+            if ack is not None and ack >= end_seq:
+                break
+        except socket.timeout:
+            continue
+
+    s.close()
 
 
 def main():
